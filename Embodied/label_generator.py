@@ -176,7 +176,8 @@ def save_debug_image(
 
 # ─── 모델 로드 ─────────────────────────────────────────────────────────────
 
-def resolve_model_path(model_path: str, model_save_dir: str, log: logging.Logger) -> str:
+def resolve_model_path(model_path: str, model_save_dir: str, log: logging.Logger,
+                       hf_token: str = '') -> str:
     """로컬 경로가 존재하면 그대로 사용, 없으면 HuggingFace에서 다운로드."""
     if os.path.isdir(model_path):
         log.info(f"로컬 모델 경로 사용: {model_path}")
@@ -192,7 +193,8 @@ def resolve_model_path(model_path: str, model_save_dir: str, log: logging.Logger
     os.makedirs(model_save_dir, exist_ok=True)
     try:
         from huggingface_hub import snapshot_download
-        snapshot_download(repo_id=model_path, local_dir=cached)
+        snapshot_download(repo_id=model_path, local_dir=cached,
+                          token=hf_token or None)
         log.info(f"모델 저장 완료: {cached}")
     except Exception as e:
         log.error(f"모델 다운로드 실패: {e}")
@@ -333,7 +335,8 @@ def main():
     log.info(f"NMS 모드: {args.nms_mode}  IoU<{args.iou_threshold}")
 
     # 모델 로드
-    model_path = resolve_model_path(args.model_path, args.model_save_dir, log)
+    hf_token = getattr(args, 'hf_token', '') or ''
+    model_path = resolve_model_path(args.model_path, args.model_save_dir, log, hf_token)
     log.info(f"LocateAnything 모델 로딩: {model_path}")
     worker = LocateAnythingWorker(model_path=model_path, device=device)
     log.info("모델 로드 완료.")

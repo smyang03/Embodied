@@ -12,6 +12,7 @@ Model Manager - HuggingFace 모델 다운로드 & 로컬 관리 도구
 
 import os
 import sys
+import json
 import shutil
 import argparse
 from pathlib import Path
@@ -164,7 +165,35 @@ def list_local(save_dir: str) -> list:
     return local_ids
 
 
-def download_model(model_id: str, save_dir: str) -> str:
+def _load_config(config_path: str) -> dict:
+    """JSON 설정 파일 로드. 파일 없거나 파싱 실패 시 빈 dict."""
+    if not config_path or not os.path.isfile(config_path):
+        return {}
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception as e:
+        print(_c(f"  [경고] config 파일 읽기 실패: {e}", YELLOW))
+        return {}
+
+
+def _resolve_token(token_arg: str, config_token: str = '') -> str | None:
+    """토큰 우선순위: CLI 인자 > config 파일 > HF_TOKEN 환경변수 > 캐시된 로그인 토큰."""
+    if token_arg:
+        return token_arg
+    if config_token:
+        return config_token
+    env = os.environ.get('HF_TOKEN') or os.environ.get('HUGGINGFACE_HUB_TOKEN')
+    if env:
+        return env
+    try:
+        from huggingface_hub import HfFolder
+        return HfFolder.get_token()  # huggingface-cli login 으로 저장된 토큰
+    except Exception:
+        return None
+
+
+def download_model(model_id: str, save_dir: str, token: str = '', config_token: str = '') -> str:
     """HuggingFace에서 모델 다운로드. 이미 있으면 스킵."""
     try:
         from huggingface_hub import snapshot_download
@@ -172,6 +201,10 @@ def download_model(model_id: str, save_dir: str) -> str:
         print(_c("\n  [오류] huggingface_hub 가 설치되지 않았습니다.", RED))
         print("  pip install huggingface-hub")
         sys.exit(1)
+
+    resolved_token = _resolve_token(token, config_token)
+    if resolved_token:
+        print(_c("  HuggingFace 토큰 사용 중.", DIM))
 
     dest = os.path.join(save_dir, _id_to_dirname(model_id))
 
@@ -188,7 +221,7 @@ def download_model(model_id: str, save_dir: str) -> str:
     print(f"  저장 경로: {dest}\n")
 
     try:
-        snapshot_download(repo_id=model_id, local_dir=dest)
+        snapshot_download(repo_id=model_id, local_dir=dest, token=resolved_token or None)
         size_gb = _dir_size_gb(dest)
         print(_c(f"\n  완료: {dest}  ({size_gb:.1f} GB)", GREEN))
         return dest
@@ -220,7 +253,7 @@ def delete_model(save_dir: str) -> None:
         print(_c(f"  삭제 완료: {dest}", GREEN))
 
 
-def interactive_menu(save_dir: str) -> None:
+def interactive_menu(save_dir: str, token: str = '') -> None:
     """대화형 메인 메뉴."""
     while True:
         print()
@@ -228,11 +261,14 @@ def interactive_menu(save_dir: str) -> None:
         print(_c("  ║     Model Manager            ║", CYAN + BOLD))
         print(_c("  ╚══════════════════════════════╝", CYAN))
         print(f"  저장 경로: {_c(save_dir, DIM)}")
+        tok_status = "있음" if _resolve_token(token) else _c("없음 (gated 모델은 토큰 필요)", YELLOW)
+        print(f"  HF 토큰:   {tok_status}")
         print()
         print("  1. 추천 모델 목록 보기 & 다운로드")
         print("  2. 직접 모델 ID 입력 & 다운로드")
         print("  3. 로컬 모델 목록 보기")
         print("  4. 로컬 모델 삭제")
+        print("  5. HuggingFace 토큰 설정")
         print("  0. 종료")
         print()
 
@@ -249,20 +285,29 @@ def interactive_menu(save_dir: str) -> None:
             except (ValueError, IndexError):
                 print(_c("  잘못된 번호.", RED))
                 continue
-            download_model(model['id'], save_dir)
+            download_model(model['id'], save_dir, token)
 
         elif choice == '2':
             print()
             model_id = input("  HuggingFace 모델 ID (예: ServiceNow-AI/LocateAnything-3B): ").strip()
             if not model_id:
                 continue
-            download_model(model_id, save_dir)
+            download_model(model_id, save_dir, token)
 
         elif choice == '3':
             list_local(save_dir)
 
         elif choice == '4':
             delete_model(save_dir)
+
+        elif choice == '5':
+            print()
+            print("  HuggingFace 토큰 발급: https://huggingface.co/settings/tokens")
+            new_tok = input("  토큰 입력 (취소: Enter): ").strip()
+            if new_tok:
+                token = new_tok
+                print(_c("  토큰 설정됨 (이번 세션에만 유지).", GREEN))
+                print(_c("  영구 저장하려면: huggingface-cli login", DIM))
 
         elif choice == '0':
             print("  종료.")
@@ -282,11 +327,16 @@ def cmd_local(args) -> None:
 
 
 def cmd_download(args) -> None:
-    download_model(args.model_id, args.save_dir)
+    cfg = _load_config(getattr(args, 'config', None))
+    download_model(args.model_id, args.save_dir,
+                   token=getattr(args, 'token', ''),
+                   config_token=cfg.get('hf_token', ''))
 
 
 def cmd_interactive(args) -> None:
-    interactive_menu(args.save_dir)
+    cfg = _load_config(getattr(args, 'config', None))
+    interactive_menu(args.save_dir,
+                     token=getattr(args, 'token', '') or cfg.get('hf_token', ''))
 
 
 # ─── CLI ───────────────────────────────────────────────────────────────────
@@ -298,8 +348,17 @@ def main():
         epilog=__doc__,
     )
     parser.add_argument(
-        '--save_dir', default='./models',
-        help='모델 저장 루트 경로 (기본: ./models)',
+        '--config', default=None,
+        help='JSON 설정 파일 경로 (save_dir, hf_token 등 포함 가능)',
+    )
+    parser.add_argument(
+        '--save_dir', default=None,
+        help='모델 저장 루트 경로 (기본: ./models, config 파일의 model_save_dir 도 인식)',
+    )
+    parser.add_argument(
+        '--token', default='',
+        help='HuggingFace 액세스 토큰. 미입력 시 config hf_token > HF_TOKEN 환경변수 > '
+             'huggingface-cli login 캐시 순으로 탐색',
     )
 
     sub = parser.add_subparsers(dest='command')
@@ -309,8 +368,14 @@ def main():
 
     dl = sub.add_parser('download', help='모델 다운로드')
     dl.add_argument('model_id', help='HuggingFace 모델 ID (예: ServiceNow-AI/LocateAnything-3B)')
+    dl.add_argument('--token', default='', help='HuggingFace 액세스 토큰')
 
     args = parser.parse_args()
+
+    # config 파일에서 save_dir 보완 (CLI > config > 기본값)
+    cfg = _load_config(getattr(args, 'config', None))
+    if not args.save_dir:
+        args.save_dir = cfg.get('model_save_dir', './models')
 
     dispatch = {
         'list':     cmd_list,
