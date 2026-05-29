@@ -23,7 +23,7 @@ from typing import Optional
 
 RECOMMENDED_MODELS = [
     {
-        "id":          "ServiceNow-AI/LocateAnything-3B",
+        "id":          "nvidia/LocateAnything-3B",
         "name":        "LocateAnything-3B",
         "category":    "Grounding / Detection",
         "size":        "~7 GB",
