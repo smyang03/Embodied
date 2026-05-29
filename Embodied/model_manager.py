@@ -12,6 +12,7 @@ Model Manager - HuggingFace 모델 다운로드 & 로컬 관리 도구
 
 import os
 import sys
+import json
 import shutil
 import argparse
 from pathlib import Path
@@ -164,10 +165,24 @@ def list_local(save_dir: str) -> list:
     return local_ids
 
 
-def _resolve_token(token_arg: str) -> str | None:
-    """토큰 우선순위: CLI 인자 > HF_TOKEN 환경변수 > 캐시된 로그인 토큰."""
+def _load_config(config_path: str) -> dict:
+    """JSON 설정 파일 로드. 파일 없거나 파싱 실패 시 빈 dict."""
+    if not config_path or not os.path.isfile(config_path):
+        return {}
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception as e:
+        print(_c(f"  [경고] config 파일 읽기 실패: {e}", YELLOW))
+        return {}
+
+
+def _resolve_token(token_arg: str, config_token: str = '') -> str | None:
+    """토큰 우선순위: CLI 인자 > config 파일 > HF_TOKEN 환경변수 > 캐시된 로그인 토큰."""
     if token_arg:
         return token_arg
+    if config_token:
+        return config_token
     env = os.environ.get('HF_TOKEN') or os.environ.get('HUGGINGFACE_HUB_TOKEN')
     if env:
         return env
@@ -178,7 +193,7 @@ def _resolve_token(token_arg: str) -> str | None:
         return None
 
 
-def download_model(model_id: str, save_dir: str, token: str = '') -> str:
+def download_model(model_id: str, save_dir: str, token: str = '', config_token: str = '') -> str:
     """HuggingFace에서 모델 다운로드. 이미 있으면 스킵."""
     try:
         from huggingface_hub import snapshot_download
@@ -187,7 +202,7 @@ def download_model(model_id: str, save_dir: str, token: str = '') -> str:
         print("  pip install huggingface-hub")
         sys.exit(1)
 
-    resolved_token = _resolve_token(token)
+    resolved_token = _resolve_token(token, config_token)
     if resolved_token:
         print(_c("  HuggingFace 토큰 사용 중.", DIM))
 
@@ -312,11 +327,16 @@ def cmd_local(args) -> None:
 
 
 def cmd_download(args) -> None:
-    download_model(args.model_id, args.save_dir, getattr(args, 'token', ''))
+    cfg = _load_config(getattr(args, 'config', None))
+    download_model(args.model_id, args.save_dir,
+                   token=getattr(args, 'token', ''),
+                   config_token=cfg.get('hf_token', ''))
 
 
 def cmd_interactive(args) -> None:
-    interactive_menu(args.save_dir, getattr(args, 'token', ''))
+    cfg = _load_config(getattr(args, 'config', None))
+    interactive_menu(args.save_dir,
+                     token=getattr(args, 'token', '') or cfg.get('hf_token', ''))
 
 
 # ─── CLI ───────────────────────────────────────────────────────────────────
@@ -328,13 +348,17 @@ def main():
         epilog=__doc__,
     )
     parser.add_argument(
-        '--save_dir', default='./models',
-        help='모델 저장 루트 경로 (기본: ./models)',
+        '--config', default=None,
+        help='JSON 설정 파일 경로 (save_dir, hf_token 등 포함 가능)',
+    )
+    parser.add_argument(
+        '--save_dir', default=None,
+        help='모델 저장 루트 경로 (기본: ./models, config 파일의 model_save_dir 도 인식)',
     )
     parser.add_argument(
         '--token', default='',
-        help='HuggingFace 액세스 토큰 (gated/private 모델 다운로드용). '
-             '미입력 시 HF_TOKEN 환경변수 → huggingface-cli login 캐시 순으로 탐색',
+        help='HuggingFace 액세스 토큰. 미입력 시 config hf_token > HF_TOKEN 환경변수 > '
+             'huggingface-cli login 캐시 순으로 탐색',
     )
 
     sub = parser.add_subparsers(dest='command')
@@ -347,6 +371,11 @@ def main():
     dl.add_argument('--token', default='', help='HuggingFace 액세스 토큰')
 
     args = parser.parse_args()
+
+    # config 파일에서 save_dir 보완 (CLI > config > 기본값)
+    cfg = _load_config(getattr(args, 'config', None))
+    if not args.save_dir:
+        args.save_dir = cfg.get('model_save_dir', './models')
 
     dispatch = {
         'list':     cmd_list,

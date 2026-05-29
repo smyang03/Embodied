@@ -1,4 +1,6 @@
 {
+  "hf_token":         "",
+
   "image_dir":        "/data/JPEGImages",
   "output_dir":       "/data/dataset",
   "model_path":       "models/LocateAnything-3B",
