@@ -92,20 +92,32 @@ def resize_for_inference(image: Image.Image, max_size: int) -> Image.Image:
 
 # ─── 박스 파싱 ─────────────────────────────────────────────────────────────
 
-def parse_boxes_normalized(answer: str) -> List[Tuple[float, float, float, float]]:
+def parse_labeled_boxes(
+    answer: str,
+    name_to_id: Dict[str, int],
+) -> List[Tuple[float, float, float, float, float, int]]:
     """
-    LocateAnything 응답에서 <box><x1><y1><x2><y2></box> 태그를 추출한다.
-    값은 0~1000 스케일 → 0.0~1.0 정규화 좌표로 변환.
+    LocateAnything 멀티클래스 응답 파싱.
+    <ref>label</ref><box><x1><y1><x2><y2></box> 형식에서 (x1,y1,x2,y2,conf,cls_id) 추출.
+    레이블이 name_to_id에 없으면 스킵.
     """
     boxes = []
-    for m in re.finditer(r"<box><(\d+)><(\d+)><(\d+)><(\d+)></box>", answer):
-        x1, y1, x2, y2 = (int(m.group(i)) / 1000.0 for i in range(1, 5))
+    pattern = re.compile(
+        r"<ref>(.*?)</ref>\s*<box><(\d+)><(\d+)><(\d+)><(\d+)></box>"
+    )
+    name_to_id_lower = {k.lower(): v for k, v in name_to_id.items()}
+    for m in pattern.finditer(answer):
+        label = m.group(1).strip().lower()
+        cls_id = name_to_id_lower.get(label)
+        if cls_id is None:
+            continue
+        x1, y1, x2, y2 = (int(m.group(i)) / 1000.0 for i in range(2, 6))
         x1 = max(0.0, min(1.0, x1))
         y1 = max(0.0, min(1.0, y1))
         x2 = max(0.0, min(1.0, x2))
         y2 = max(0.0, min(1.0, y2))
         if x2 > x1 and y2 > y1:
-            boxes.append((x1, y1, x2, y2))
+            boxes.append((x1, y1, x2, y2, 1.0, cls_id))
     return boxes
 
 
@@ -341,10 +353,10 @@ def main():
         name, cid = parts[0].strip(), int(parts[1].strip())
         class_map[cid] = name
 
-    # 클래스 ID 순서대로 정렬된 리스트 (detect 호출용)
-    sorted_classes = sorted(class_map.items())  # [(cls_id, name), ...]
-    category_names = [name for _, name in sorted_classes]
-    category_ids   = [cid  for cid,  _ in sorted_classes]
+    # 단일 detect 호출용 이름→ID 역맵
+    name_to_id: Dict[str, int] = {name: cid for cid, name in class_map.items()}
+    # 클래스 ID 순서대로 정렬된 카테고리 목록
+    category_names = [name for _, name in sorted(class_map.items())]
 
     log.info(f"클래스: {class_map}")
     log.info(f"NMS 모드: {args.nms_mode}  IoU<{args.iou_threshold}")
@@ -392,32 +404,29 @@ def main():
         if infer_image.size != original_image.size:
             log.debug(f"  리사이즈: {original_image.size} → {infer_image.size}")
 
-        # 클래스별 개별 detect 호출 → cls_id 정확히 매핑
-        # (LocateAnything 다중 카테고리 응답은 박스-클래스 순서를 보장하지 않음)
+        # 전체 클래스를 단일 detect 호출로 처리 (3배 빠름)
+        # 출력: <ref>label</ref><box><x1><y1><x2><y2></box> 형식으로 레이블 포함
         all_boxes: List[Tuple] = []
 
-        for cls_id, class_name in class_map.items():
-            try:
-                r = worker.detect(
-                    infer_image,
-                    [class_name],
-                    generation_mode=args.generation_mode,
-                    temperature=args.temperature,
-                    max_new_tokens=args.max_new_tokens,
-                    verbose=False,
-                )
-                raw = parse_boxes_normalized(r.get('answer', ''))
-                for (x1, y1, x2, y2) in raw:
-                    all_boxes.append((x1, y1, x2, y2, 1.0, cls_id))
-            except torch.cuda.OutOfMemoryError:
-                log.warning(
-                    f"OOM 발생: {img_path.name} [{class_name}] "
-                    f"(max_input_size={args.max_input_size}). "
-                    "--max_input_size 를 줄이거나 --expandable_segments 를 추가하세요."
-                )
-                torch.cuda.empty_cache()
-            except Exception as e:
-                log.warning(f"추론 실패 {img_path.name} [{class_name}]: {e}")
+        try:
+            r = worker.detect(
+                infer_image,
+                category_names,
+                generation_mode=args.generation_mode,
+                temperature=args.temperature,
+                max_new_tokens=args.max_new_tokens,
+                verbose=False,
+            )
+            all_boxes = parse_labeled_boxes(r.get('answer', ''), name_to_id)
+        except torch.cuda.OutOfMemoryError:
+            log.warning(
+                f"OOM 발생: {img_path.name} "
+                f"(max_input_size={args.max_input_size}). "
+                "--max_input_size 를 줄이거나 --expandable_segments 를 추가하세요."
+            )
+            torch.cuda.empty_cache()
+        except Exception as e:
+            log.warning(f"추론 실패 {img_path.name}: {e}")
 
         # NMS 적용 (LocateAnything은 confidence 없으므로 conf=1.0 고정, IoU만 사용)
         final_boxes = apply_nms(all_boxes, args.nms_mode, args.iou_threshold)
