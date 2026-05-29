@@ -1,7 +1,7 @@
 {
   "image_dir":        "/data/JPEGImages",
   "output_dir":       "/data/dataset",
-  "model_path":       "NVEagle/Eagle-X5-13B-Chat",
+  "model_path":       "models/LocateAnything-3B",
   "model_save_dir":   "./models",
 
   "prompts": [
@@ -9,15 +9,20 @@
     { "name": "car",      "id": 1 },
     { "name": "bicycle",  "id": 2 }
   ],
-  "conv_mode": "vicuna_v1",
 
-  "conf_threshold": 0.5,
+  "max_input_size": 1024,
+
   "iou_threshold":  0.45,
   "nms_mode":       "per_class",
+
+  "generation_mode":  "hybrid",
+  "temperature":      0.7,
+  "max_new_tokens":   8192,
 
   "debug_interval":    1000,
   "debug_output_dir":  "./debug_images",
 
-  "gpu":    "0",
-  "resume": false
+  "gpu":                 "0",
+  "resume":              false,
+  "expandable_segments": true
 }

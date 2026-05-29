@@ -1,54 +1,42 @@
 #!/usr/bin/env python3
 """
-YOLOv7 Auto-Labeling Tool using Eagle VLM
+YOLOv7 Auto-Labeling Tool using LocateAnything VLM
 
 Usage example:
-  python label_generator.py \
-    --image_dir /data/JPEGImages \
-    --output_dir /data/dataset \
-    --model_path NVEagle/Eagle-X5-13B-Chat \
-    --model_save_dir ./models \
-    --prompts "person:0" "car:1" "bicycle:2" \
-    --conf_threshold 0.5 \
-    --iou_threshold 0.45 \
-    --nms_mode per_class \
-    --debug_interval 1000 \
+  python label_generator.py \\
+    --image_dir /data/JPEGImages \\
+    --output_dir /data/dataset \\
+    --model_path models/LocateAnything-3B \\
+    --prompts "person:0" "car:1" "bicycle:2" \\
+    --iou_threshold 0.45 \\
+    --nms_mode per_class \\
+    --max_input_size 1024 \\
+    --debug_interval 1000 \\
     --gpu 0
+
+  # JSON 설정 파일 사용
+  python label_generator.py --config label_config.example.json
+
+  # 설정 파일 + CLI 덮어쓰기
+  python label_generator.py --config label_config.example.json --gpu 1 --max_input_size 768
 """
 
 import os
 import sys
-import json
 import re
+import json
 import argparse
 import logging
 from pathlib import Path
-from typing import List, Dict, Tuple
+from typing import Dict, List, Tuple
 
 import torch
-import numpy as np
 from PIL import Image, ImageDraw
 from tqdm import tqdm
 
-# Eagle 모듈 경로 추가 (같은 레포 내 Eagle 폴더)
-_EAGLE_PATH = Path(__file__).resolve().parent.parent / "Eagle"
-if str(_EAGLE_PATH) not in sys.path:
-    sys.path.insert(0, str(_EAGLE_PATH))
-
-try:
-    from eagle.model.builder import load_pretrained_model
-    from eagle.utils import disable_torch_init
-    from eagle.mm_utils import tokenizer_image_token, get_model_name_from_path, process_images
-    from eagle.constants import (
-        IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN,
-        DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN,
-    )
-    from eagle.conversation import conv_templates
-except ImportError as e:
-    print(f"[ERROR] Eagle 모듈을 찾을 수 없습니다: {e}")
-    print(f"  Eagle 경로: {_EAGLE_PATH}")
-    print("  Eagle 폴더가 상위 디렉토리에 있는지 확인하세요.")
-    sys.exit(1)
+# locateanything_worker.py 는 이 파일과 같은 디렉토리에 있어야 함
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from locateanything_worker import LocateAnythingWorker
 
 
 # ─── 상수 ──────────────────────────────────────────────────────────────────
@@ -60,89 +48,48 @@ BOX_COLORS = [
     'orange', 'purple', 'pink', 'brown', 'coral', 'gold',
 ]
 
-# Eagle에 보낼 프롬프트 템플릿
-DETECTION_PROMPT = (
-    'Detect all instances of "{class_name}" in this image.\n'
-    'For each detected object output a bounding box [x1, y1, x2, y2] '
-    'where values are normalized 0.0–1.0 '
-    '(x1,y1=top-left corner, x2,y2=bottom-right corner) '
-    'and a confidence score 0.0–1.0.\n'
-    'Respond with ONLY a valid JSON array, no explanation:\n'
-    '[{{"bbox": [x1, y1, x2, y2], "confidence": 0.95}}, ...]\n'
-    'If no object is found respond with exactly: []'
-)
+
+# ─── 이미지 리사이즈 ────────────────────────────────────────────────────────
+
+def resize_for_inference(image: Image.Image, max_size: int) -> Image.Image:
+    """장변이 max_size를 넘으면 비율 유지하며 축소. 넘지 않으면 원본 반환."""
+    if max_size <= 0:
+        return image
+    if max(image.size) <= max_size:
+        return image
+    img = image.copy()
+    img.thumbnail((max_size, max_size), Image.LANCZOS)
+    return img
 
 
-# ─── 파싱 ──────────────────────────────────────────────────────────────────
+# ─── 박스 파싱 ─────────────────────────────────────────────────────────────
 
-def _clamp01(v: float) -> float:
-    return max(0.0, min(1.0, v))
-
-
-def parse_bbox_response(
-    response: str,
-    img_w: int,
-    img_h: int,
-) -> List[Dict]:
-    """Eagle 텍스트 응답에서 bounding box 목록을 추출한다."""
-    response = response.strip()
-
-    # 1) JSON 배열 파싱 시도
-    json_match = re.search(r'\[.*?\]', response, re.DOTALL)
-    if json_match:
-        try:
-            data = json.loads(json_match.group())
-            boxes = []
-            for item in data:
-                if not isinstance(item, dict):
-                    continue
-                bbox = item.get('bbox') or item.get('box') or item.get('coordinates')
-                conf = float(item.get('confidence', item.get('score', item.get('conf', 0.85))))
-                if not bbox or len(bbox) != 4:
-                    continue
-                x1, y1, x2, y2 = (float(v) for v in bbox)
-                # 픽셀 좌표인 경우 정규화
-                if x2 > 1.5 or y2 > 1.5:
-                    x1 /= img_w; y1 /= img_h
-                    x2 /= img_w; y2 /= img_h
-                x1, y1, x2, y2 = (_clamp01(v) for v in (x1, y1, x2, y2))
-                if x2 > x1 and y2 > y1:
-                    boxes.append({'bbox': [x1, y1, x2, y2], 'confidence': conf})
-            return boxes
-        except (json.JSONDecodeError, ValueError, TypeError):
-            pass
-
-    # 2) 정규식 폴백: [0.1, 0.2, 0.8, 0.9] 패턴 탐색
+def parse_boxes_normalized(answer: str) -> List[Tuple[float, float, float, float]]:
+    """
+    LocateAnything 응답에서 <box><x1><y1><x2><y2></box> 태그를 추출한다.
+    값은 0~1000 스케일 → 0.0~1.0 정규화 좌표로 변환.
+    """
     boxes = []
-    pattern = r'\[\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)\s*\]'
-    for m in re.finditer(pattern, response):
-        try:
-            x1, y1, x2, y2 = (float(m.group(i)) for i in range(1, 5))
-            if x2 > 1.5 or y2 > 1.5:
-                x1 /= img_w; y1 /= img_h
-                x2 /= img_w; y2 /= img_h
-            x1, y1, x2, y2 = (_clamp01(v) for v in (x1, y1, x2, y2))
-            if x2 > x1 and y2 > y1:
-                boxes.append({'bbox': [x1, y1, x2, y2], 'confidence': 0.8})
-        except ValueError:
-            continue
+    for m in re.finditer(r"<box><(\d+)><(\d+)><(\d+)><(\d+)></box>", answer):
+        x1, y1, x2, y2 = (int(m.group(i)) / 1000.0 for i in range(1, 5))
+        x1 = max(0.0, min(1.0, x1))
+        y1 = max(0.0, min(1.0, y1))
+        x2 = max(0.0, min(1.0, x2))
+        y2 = max(0.0, min(1.0, y2))
+        if x2 > x1 and y2 > y1:
+            boxes.append((x1, y1, x2, y2))
     return boxes
 
 
 # ─── 좌표 변환 ─────────────────────────────────────────────────────────────
 
 def xyxy_to_yolo(x1: float, y1: float, x2: float, y2: float) -> Tuple:
-    cx = (x1 + x2) / 2
-    cy = (y1 + y2) / 2
-    w  = x2 - x1
-    h  = y2 - y1
-    return cx, cy, w, h
+    return (x1 + x2) / 2, (y1 + y2) / 2, x2 - x1, y2 - y1
 
 
 # ─── NMS ───────────────────────────────────────────────────────────────────
 
 def _iou(a: Tuple, b: Tuple) -> float:
-    """a, b: (x1, y1, x2, y2) normalized"""
     ix1 = max(a[0], b[0]); iy1 = max(a[1], b[1])
     ix2 = min(a[2], b[2]); iy2 = min(a[3], b[3])
     inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
@@ -154,7 +101,7 @@ def _iou(a: Tuple, b: Tuple) -> float:
 
 
 def _nms_single(boxes: List, iou_thr: float) -> List:
-    """boxes: list of (x1,y1,x2,y2,conf,cls_id), confidence 내림차순 정렬 후 NMS."""
+    """boxes: list of (x1,y1,x2,y2, conf, cls_id)"""
     boxes = sorted(boxes, key=lambda x: x[4], reverse=True)
     keep = []
     while boxes:
@@ -164,21 +111,14 @@ def _nms_single(boxes: List, iou_thr: float) -> List:
     return keep
 
 
-def apply_nms(
-    all_boxes: List,
-    nms_mode: str,
-    conf_thr: float,
-    iou_thr: float,
-) -> List:
-    filtered = [b for b in all_boxes if b[4] >= conf_thr]
-    if not filtered:
+def apply_nms(all_boxes: List, nms_mode: str, iou_thr: float) -> List:
+    if not all_boxes:
         return []
     if nms_mode == 'unified':
-        return _nms_single(filtered, iou_thr)
-    # per_class
+        return _nms_single(all_boxes, iou_thr)
     result = []
-    for cls_id in {b[5] for b in filtered}:
-        result.extend(_nms_single([b for b in filtered if b[5] == cls_id], iou_thr))
+    for cls_id in {b[5] for b in all_boxes}:
+        result.extend(_nms_single([b for b in all_boxes if b[5] == cls_id], iou_thr))
     return result
 
 
@@ -194,62 +134,16 @@ def save_debug_image(
     draw = ImageDraw.Draw(img)
     iw, ih = img.size
 
-    for (x1, y1, x2, y2, conf, cls_id) in boxes:
+    for (x1, y1, x2, y2, _conf, cls_id) in boxes:
         color = BOX_COLORS[cls_id % len(BOX_COLORS)]
         px1, py1 = int(x1 * iw), int(y1 * ih)
         px2, py2 = int(x2 * iw), int(y2 * ih)
         draw.rectangle([px1, py1, px2, py2], outline=color, width=3)
-        label = f"{class_map.get(cls_id, str(cls_id))} {conf:.2f}"
-        draw.rectangle([px1, max(0, py1 - 18), px1 + len(label) * 7, py1], fill=color)
+        label = class_map.get(cls_id, str(cls_id))
+        draw.rectangle([px1, max(0, py1 - 18), px1 + len(label) * 7 + 4, py1], fill=color)
         draw.text((px1 + 2, max(0, py1 - 17)), label, fill='white')
 
-    img.save(output_path)
-
-
-# ─── Eagle 추론 ────────────────────────────────────────────────────────────
-
-def infer_single(
-    model,
-    tokenizer,
-    image_processor,
-    image: Image.Image,
-    prompt_text: str,
-    conv_mode: str,
-    device: str,
-) -> str:
-    if model.config.mm_use_im_start_end:
-        inp = (DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN +
-               DEFAULT_IM_END_TOKEN + '\n' + prompt_text)
-    else:
-        inp = DEFAULT_IMAGE_TOKEN + '\n' + prompt_text
-
-    conv = conv_templates[conv_mode].copy()
-    conv.append_message(conv.roles[0], inp)
-    conv.append_message(conv.roles[1], None)
-    prompt = conv.get_prompt()
-
-    image_tensor = process_images([image], image_processor, model.config)[0]
-    input_ids = tokenizer_image_token(
-        prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt'
-    )
-
-    input_ids = input_ids.unsqueeze(0).to(device=device, non_blocking=True)
-    image_tensor = image_tensor.unsqueeze(0).to(
-        dtype=torch.float16, device=device, non_blocking=True
-    )
-
-    with torch.inference_mode():
-        output_ids = model.generate(
-            input_ids,
-            images=image_tensor,
-            image_sizes=[image.size],
-            do_sample=False,
-            temperature=0.0,
-            max_new_tokens=512,
-            use_cache=True,
-        )
-
-    return tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
+    img.save(output_path, quality=92)
 
 
 # ─── 모델 로드 ─────────────────────────────────────────────────────────────
@@ -260,7 +154,6 @@ def resolve_model_path(model_path: str, model_save_dir: str, log: logging.Logger
         log.info(f"로컬 모델 경로 사용: {model_path}")
         return model_path
 
-    # 캐시 경로: models/NVEagle__Eagle-X5-13B-Chat
     safe_name = model_path.replace('/', '__')
     cached = os.path.join(model_save_dir, safe_name)
     if os.path.isdir(cached):
@@ -280,13 +173,12 @@ def resolve_model_path(model_path: str, model_save_dir: str, log: logging.Logger
     return cached
 
 
-# ─── 메인 ──────────────────────────────────────────────────────────────────
+# ─── 설정 파일 ─────────────────────────────────────────────────────────────
 
 def _load_config(config_path: str) -> Dict:
-    """JSON 설정 파일을 읽어 dict로 반환."""
     with open(config_path, 'r', encoding='utf-8') as f:
         cfg = json.load(f)
-    # prompts 키: list of str 또는 list of {"name": ..., "id": ...} 두 형식 모두 허용
+    # prompts: [{"name":..,"id":..}] 또는 ["name:id"] 두 형식 모두 허용
     if 'prompts' in cfg and isinstance(cfg['prompts'], list):
         converted = []
         for item in cfg['prompts']:
@@ -298,75 +190,92 @@ def _load_config(config_path: str) -> Dict:
     return cfg
 
 
+# ─── 인자 파싱 ─────────────────────────────────────────────────────────────
+
 def parse_args():
     # 1단계: --config 만 먼저 파싱
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument('--config', default=None, help='JSON 설정 파일 경로')
     pre_args, remaining = pre.parse_known_args()
 
-    # 2단계: config 파일 로드 → argparse 기본값으로 주입
     cfg_defaults: Dict = {}
     if pre_args.config:
         cfg_defaults = _load_config(pre_args.config)
 
-    # config 에 필수 항목이 있으면 required=False 로 전환
     def _req(key: str) -> bool:
         return key not in cfg_defaults
 
     parser = argparse.ArgumentParser(
-        description='Eagle VLM 기반 YOLOv7 자동 라벨 생성 도구',
+        description='LocateAnything 기반 YOLOv7 자동 라벨 생성 도구',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
         parents=[pre],
     )
 
     # 경로
-    parser.add_argument('--image_dir',     required=_req('image_dir'),
+    parser.add_argument('--image_dir',      required=_req('image_dir'),
                         help='JPEGImages 폴더 경로')
-    parser.add_argument('--output_dir',    required=_req('output_dir'),
+    parser.add_argument('--output_dir',     required=_req('output_dir'),
                         help='출력 루트 경로 (output_dir/labels/ 에 라벨 저장)')
-    parser.add_argument('--model_path',    required=_req('model_path'),
+    parser.add_argument('--model_path',     required=_req('model_path'),
                         help='로컬 모델 폴더 경로 또는 HuggingFace ID '
-                             '(예: NVEagle/Eagle-X5-13B-Chat)')
+                             '(예: ServiceNow-AI/LocateAnything-3B)')
     parser.add_argument('--model_save_dir', default='./models',
                         help='모델 다운로드 저장 경로 (기본: ./models)')
 
-    # 클래스 / 프롬프트
+    # 클래스
     parser.add_argument('--prompts', nargs='+', required=_req('prompts'),
-                        help='클래스 프롬프트 "클래스명:클래스ID" 형식 '
+                        help='클래스 정의 "클래스명:클래스ID" 형식 '
                              '(예: "person:0" "car:1" "bicycle:2")')
-    parser.add_argument('--conv_mode', default='vicuna_v1',
-                        help='Eagle 대화 모드 (기본: vicuna_v1)')
+
+    # 이미지 입력 크기
+    parser.add_argument('--max_input_size', type=int, default=1024,
+                        help='추론 전 이미지 장변 최대 크기 px (OOM 방지, 0=리사이즈 없음, 기본: 1024)')
 
     # NMS
-    parser.add_argument('--conf_threshold', type=float, default=0.5,
-                        help='Confidence 임계값 (기본: 0.5)')
     parser.add_argument('--iou_threshold',  type=float, default=0.45,
                         help='NMS IoU 임계값 (기본: 0.45)')
-    parser.add_argument('--nms_mode', choices=['unified', 'per_class'],
+    parser.add_argument('--nms_mode',       choices=['unified', 'per_class'],
                         default='per_class',
                         help='NMS 방식: unified=전체통합, per_class=클래스별 (기본: per_class)')
 
     # 디버그
-    parser.add_argument('--debug_interval', type=int, default=0,
+    parser.add_argument('--debug_interval',   type=int, default=0,
                         help='N장마다 디버그 이미지 저장 (0=비활성, 예: 1000)')
     parser.add_argument('--debug_output_dir', default='./debug_images',
                         help='디버그 이미지 저장 경로 (기본: ./debug_images)')
 
     # 실행 옵션
-    parser.add_argument('--gpu', default='0',
+    parser.add_argument('--gpu',    default='0',
                         help='사용할 GPU ID (예: "0", "0,1") (기본: 0)')
     parser.add_argument('--resume', action='store_true',
                         help='이미 라벨 파일이 존재하는 이미지 스킵')
+    parser.add_argument('--expandable_segments', action='store_true',
+                        help='PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True 설정 (메모리 단편화 완화)')
 
-    # config 값을 기본값으로 설정 (CLI 인자가 있으면 CLI 우선)
+    # 추론 파라미터
+    parser.add_argument('--generation_mode', default='hybrid',
+                        choices=['hybrid', 'ar', 'nar'],
+                        help='LocateAnything 생성 모드 (기본: hybrid)')
+    parser.add_argument('--temperature',  type=float, default=0.7,
+                        help='샘플링 온도 (기본: 0.7)')
+    parser.add_argument('--max_new_tokens', type=int, default=8192,
+                        help='최대 생성 토큰 수 (기본: 8192)')
+
     parser.set_defaults(**cfg_defaults)
-
     return parser.parse_args(remaining)
 
 
+# ─── 메인 ──────────────────────────────────────────────────────────────────
+
 def main():
     args = parse_args()
+
+    # expandable_segments 설정은 import torch 전에 해야 효과가 있으나
+    # 여기서는 이미 import된 상태이므로 환경변수로 남겨 다음 프로세스에서 활성화됨.
+    # 즉시 효과를 원하면 실행 전에 직접 환경변수를 설정하거나 --expandable_segments 플래그 사용.
+    if args.expandable_segments:
+        os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
     logging.basicConfig(
         level=logging.INFO,
@@ -378,9 +287,11 @@ def main():
     # GPU 설정
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    log.info(f"디바이스: {device}  (CUDA_VISIBLE_DEVICES={args.gpu})")
+    log.info(f"디바이스: {device}  (GPU: {args.gpu})")
+    if args.max_input_size > 0:
+        log.info(f"이미지 입력 크기 제한: 장변 최대 {args.max_input_size}px")
 
-    # 클래스 맵 파싱
+    # 클래스 맵 파싱: {cls_id: class_name}
     class_map: Dict[int, str] = {}
     for p in args.prompts:
         parts = p.rsplit(':', 1)
@@ -389,18 +300,19 @@ def main():
             sys.exit(1)
         name, cid = parts[0].strip(), int(parts[1].strip())
         class_map[cid] = name
-    log.info(f"클래스 맵: {class_map}")
-    log.info(f"NMS 모드: {args.nms_mode}  conf≥{args.conf_threshold}  IoU<{args.iou_threshold}")
+
+    # 클래스 ID 순서대로 정렬된 리스트 (detect 호출용)
+    sorted_classes = sorted(class_map.items())  # [(cls_id, name), ...]
+    category_names = [name for _, name in sorted_classes]
+    category_ids   = [cid  for cid,  _ in sorted_classes]
+
+    log.info(f"클래스: {class_map}")
+    log.info(f"NMS 모드: {args.nms_mode}  IoU<{args.iou_threshold}")
 
     # 모델 로드
     model_path = resolve_model_path(args.model_path, args.model_save_dir, log)
-    disable_torch_init()
-    model_name = get_model_name_from_path(model_path)
-    log.info(f"Eagle 모델 로딩: {model_name}")
-    tokenizer, model, image_processor, _ = load_pretrained_model(
-        model_path, None, model_name, False, False
-    )
-    model = model.to(device)
+    log.info(f"LocateAnything 모델 로딩: {model_path}")
+    worker = LocateAnythingWorker(model_path=model_path, device=device)
     log.info("모델 로드 완료.")
 
     # 출력 디렉토리
@@ -417,7 +329,6 @@ def main():
     )
     log.info(f"이미지 {len(image_files)}장 발견: {image_dir}")
 
-    # 통계
     total_labeled = 0
     total_boxes   = 0
     skipped       = 0
@@ -430,32 +341,72 @@ def main():
             continue
 
         try:
-            image = Image.open(img_path).convert('RGB')
-            img_w, img_h = image.size
+            original_image = Image.open(img_path).convert('RGB')
         except Exception as e:
             log.warning(f"이미지 열기 실패 {img_path.name}: {e}")
             continue
 
+        # 추론용 리사이즈 (라벨 좌표는 0~1 정규화라서 원본 크기 무관)
+        infer_image = resize_for_inference(original_image, args.max_input_size)
+        if infer_image.size != original_image.size:
+            log.debug(f"  리사이즈: {original_image.size} → {infer_image.size}")
+
+        try:
+            result = worker.detect(
+                infer_image,
+                category_names,
+                generation_mode=args.generation_mode,
+                temperature=args.temperature,
+                max_new_tokens=args.max_new_tokens,
+                verbose=False,
+            )
+            answer = result.get('answer', '')
+        except torch.cuda.OutOfMemoryError:
+            log.warning(
+                f"OOM 발생: {img_path.name} (현재 max_input_size={args.max_input_size}). "
+                "--max_input_size 값을 줄이거나 --expandable_segments 를 추가하세요."
+            )
+            torch.cuda.empty_cache()
+            continue
+        except Exception as e:
+            log.warning(f"추론 실패 {img_path.name}: {e}")
+            continue
+
+        # <box> 태그 파싱 → 카테고리별 cls_id 매핑
+        # LocateAnything은 모든 카테고리를 한 번에 처리하고
+        # 응답 내 박스 순서가 카테고리 순서를 보장하지 않으므로
+        # 카테고리별로 개별 detect 호출하여 cls_id를 명확히 매핑
         all_boxes: List[Tuple] = []
 
-        for cls_id, class_name in class_map.items():
-            prompt = DETECTION_PROMPT.format(class_name=class_name)
-            try:
-                response = infer_single(
-                    model, tokenizer, image_processor,
-                    image, prompt, args.conv_mode, device,
-                )
-                raw_boxes = parse_bbox_response(response, img_w, img_h)
-                for b in raw_boxes:
-                    x1, y1, x2, y2 = b['bbox']
-                    all_boxes.append((x1, y1, x2, y2, b['confidence'], cls_id))
-            except Exception as e:
-                log.warning(f"추론 실패 {img_path.name} [{class_name}]: {e}")
+        if len(category_names) == 1:
+            # 단일 클래스: 바로 파싱
+            raw = parse_boxes_normalized(answer)
+            cls_id = category_ids[0]
+            for (x1, y1, x2, y2) in raw:
+                all_boxes.append((x1, y1, x2, y2, 1.0, cls_id))
+        else:
+            # 다중 클래스: 클래스별 개별 호출로 cls_id 정확히 매핑
+            for cls_id, class_name in class_map.items():
+                try:
+                    r = worker.detect(
+                        infer_image,
+                        [class_name],
+                        generation_mode=args.generation_mode,
+                        temperature=args.temperature,
+                        max_new_tokens=args.max_new_tokens,
+                        verbose=False,
+                    )
+                    raw = parse_boxes_normalized(r.get('answer', ''))
+                    for (x1, y1, x2, y2) in raw:
+                        all_boxes.append((x1, y1, x2, y2, 1.0, cls_id))
+                except torch.cuda.OutOfMemoryError:
+                    log.warning(f"OOM: {img_path.name} [{class_name}] 스킵")
+                    torch.cuda.empty_cache()
+                except Exception as e:
+                    log.warning(f"추론 실패 {img_path.name} [{class_name}]: {e}")
 
-        # NMS 적용
-        final_boxes = apply_nms(
-            all_boxes, args.nms_mode, args.conf_threshold, args.iou_threshold
-        )
+        # NMS 적용 (LocateAnything은 confidence 없으므로 conf=1.0 고정, IoU만 사용)
+        final_boxes = apply_nms(all_boxes, args.nms_mode, args.iou_threshold)
         total_boxes += len(final_boxes)
 
         # YOLO 라벨 저장
@@ -465,7 +416,7 @@ def main():
                 f.write(f"{cls_id} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}\n")
         total_labeled += 1
 
-        # 디버그 이미지
+        # 디버그 시각화 (원본 이미지에 박스 드로잉)
         if args.debug_interval > 0 and (idx + 1) % args.debug_interval == 0:
             debug_path = os.path.join(
                 args.debug_output_dir,
@@ -474,6 +425,7 @@ def main():
             save_debug_image(str(img_path), final_boxes, class_map, debug_path)
             log.info(
                 f"[DEBUG {idx+1}/{len(image_files)}] {img_path.name} "
+                f"({original_image.size[0]}×{original_image.size[1]}) "
                 f"→ {len(final_boxes)}개 박스 | {debug_path}"
             )
 
