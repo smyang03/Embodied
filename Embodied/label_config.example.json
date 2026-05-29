@@ -1,0 +1,23 @@
+{
+  "image_dir":        "/data/JPEGImages",
+  "output_dir":       "/data/dataset",
+  "model_path":       "NVEagle/Eagle-X5-13B-Chat",
+  "model_save_dir":   "./models",
+
+  "prompts": [
+    { "name": "person",   "id": 0 },
+    { "name": "car",      "id": 1 },
+    { "name": "bicycle",  "id": 2 }
+  ],
+  "conv_mode": "vicuna_v1",
+
+  "conf_threshold": 0.5,
+  "iou_threshold":  0.45,
+  "nms_mode":       "per_class",
+
+  "debug_interval":    1000,
+  "debug_output_dir":  "./debug_images",
+
+  "gpu":    "0",
+  "resume": false
+}

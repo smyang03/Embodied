@@ -282,26 +282,57 @@ def resolve_model_path(model_path: str, model_save_dir: str, log: logging.Logger
 
 # ─── 메인 ──────────────────────────────────────────────────────────────────
 
+def _load_config(config_path: str) -> Dict:
+    """JSON 설정 파일을 읽어 dict로 반환."""
+    with open(config_path, 'r', encoding='utf-8') as f:
+        cfg = json.load(f)
+    # prompts 키: list of str 또는 list of {"name": ..., "id": ...} 두 형식 모두 허용
+    if 'prompts' in cfg and isinstance(cfg['prompts'], list):
+        converted = []
+        for item in cfg['prompts']:
+            if isinstance(item, dict):
+                converted.append(f"{item['name']}:{item['id']}")
+            else:
+                converted.append(str(item))
+        cfg['prompts'] = converted
+    return cfg
+
+
 def parse_args():
+    # 1단계: --config 만 먼저 파싱
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument('--config', default=None, help='JSON 설정 파일 경로')
+    pre_args, remaining = pre.parse_known_args()
+
+    # 2단계: config 파일 로드 → argparse 기본값으로 주입
+    cfg_defaults: Dict = {}
+    if pre_args.config:
+        cfg_defaults = _load_config(pre_args.config)
+
+    # config 에 필수 항목이 있으면 required=False 로 전환
+    def _req(key: str) -> bool:
+        return key not in cfg_defaults
+
     parser = argparse.ArgumentParser(
         description='Eagle VLM 기반 YOLOv7 자동 라벨 생성 도구',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
+        parents=[pre],
     )
 
     # 경로
-    parser.add_argument('--image_dir',     required=True,
+    parser.add_argument('--image_dir',     required=_req('image_dir'),
                         help='JPEGImages 폴더 경로')
-    parser.add_argument('--output_dir',    required=True,
+    parser.add_argument('--output_dir',    required=_req('output_dir'),
                         help='출력 루트 경로 (output_dir/labels/ 에 라벨 저장)')
-    parser.add_argument('--model_path',    required=True,
+    parser.add_argument('--model_path',    required=_req('model_path'),
                         help='로컬 모델 폴더 경로 또는 HuggingFace ID '
                              '(예: NVEagle/Eagle-X5-13B-Chat)')
     parser.add_argument('--model_save_dir', default='./models',
                         help='모델 다운로드 저장 경로 (기본: ./models)')
 
     # 클래스 / 프롬프트
-    parser.add_argument('--prompts', nargs='+', required=True,
+    parser.add_argument('--prompts', nargs='+', required=_req('prompts'),
                         help='클래스 프롬프트 "클래스명:클래스ID" 형식 '
                              '(예: "person:0" "car:1" "bicycle:2")')
     parser.add_argument('--conv_mode', default='vicuna_v1',
@@ -328,7 +359,10 @@ def parse_args():
     parser.add_argument('--resume', action='store_true',
                         help='이미 라벨 파일이 존재하는 이미지 스킵')
 
-    return parser.parse_args()
+    # config 값을 기본값으로 설정 (CLI 인자가 있으면 CLI 우선)
+    parser.set_defaults(**cfg_defaults)
+
+    return parser.parse_args(remaining)
 
 
 def main():
