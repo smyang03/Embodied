@@ -179,10 +179,25 @@ def save_debug_image(
 def resolve_model_path(model_path: str, model_save_dir: str, log: logging.Logger,
                        hf_token: str = '') -> str:
     """로컬 경로가 존재하면 그대로 사용, 없으면 HuggingFace에서 다운로드."""
+    # 절대경로 / 상대경로(./ ../)는 로컬 경로로 간주 → HF 시도 안 함
+    _is_local_path = (
+        os.path.isabs(model_path)
+        or model_path.startswith('./')
+        or model_path.startswith('../')
+        or model_path.startswith('.\\')
+        or model_path.startswith('..\\')
+    )
+
     if os.path.isdir(model_path):
         log.info(f"로컬 모델 경로 사용: {model_path}")
         return model_path
 
+    if _is_local_path:
+        log.error(f"경로가 존재하지 않습니다: {os.path.abspath(model_path)}")
+        log.error("model_path 를 확인하세요. 실행 위치 기준 상대경로입니다.")
+        sys.exit(1)
+
+    # HuggingFace 모델 ID (namespace/model-name 형식)
     safe_name = model_path.replace('/', '__')
     cached = os.path.join(model_save_dir, safe_name)
     if os.path.isdir(cached):
