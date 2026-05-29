@@ -12,7 +12,6 @@ Model Manager - HuggingFace 모델 다운로드 & 로컬 관리 도구
 
 import os
 import sys
-import json
 import shutil
 import argparse
 from pathlib import Path

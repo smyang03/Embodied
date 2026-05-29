@@ -30,6 +30,34 @@ import logging
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+# ── 환경변수는 torch/CUDA 초기화 전에 설정해야 확실히 적용됨 ──────────────
+# parse_args()를 먼저 호출해 GPU, expandable_segments 값을 확보한 뒤 설정
+def _apply_env_early():
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument('--config',              default=None)
+    pre.add_argument('--gpu',                 default='0')
+    pre.add_argument('--expandable_segments', action='store_true')
+    known, _ = pre.parse_known_args()
+
+    # config 파일에서도 읽을 수 있도록
+    gpu = known.gpu
+    expandable = known.expandable_segments
+    if not expandable and known.config:
+        try:
+            with open(known.config) as f:
+                cfg = json.load(f)
+            gpu = str(cfg.get('gpu', gpu))
+            expandable = bool(cfg.get('expandable_segments', expandable))
+        except Exception:
+            pass
+
+    os.environ['CUDA_VISIBLE_DEVICES'] = gpu
+    if expandable:
+        os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
+_apply_env_early()
+# ──────────────────────────────────────────────────────────────────────────
+
 import torch
 from PIL import Image, ImageDraw
 from tqdm import tqdm
@@ -271,12 +299,6 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # expandable_segments 설정은 import torch 전에 해야 효과가 있으나
-    # 여기서는 이미 import된 상태이므로 환경변수로 남겨 다음 프로세스에서 활성화됨.
-    # 즉시 효과를 원하면 실행 전에 직접 환경변수를 설정하거나 --expandable_segments 플래그 사용.
-    if args.expandable_segments:
-        os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
-
     logging.basicConfig(
         level=logging.INFO,
         format='[%(asctime)s %(levelname)s] %(message)s',
@@ -284,10 +306,11 @@ def main():
     )
     log = logging.getLogger(__name__)
 
-    # GPU 설정
-    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
+    # 환경변수는 _apply_env_early() 에서 torch import 전에 이미 적용됨
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     log.info(f"디바이스: {device}  (GPU: {args.gpu})")
+    if args.expandable_segments:
+        log.info("PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True 적용됨")
     if args.max_input_size > 0:
         log.info(f"이미지 입력 크기 제한: 장변 최대 {args.max_input_size}px")
 
@@ -351,59 +374,32 @@ def main():
         if infer_image.size != original_image.size:
             log.debug(f"  리사이즈: {original_image.size} → {infer_image.size}")
 
-        try:
-            result = worker.detect(
-                infer_image,
-                category_names,
-                generation_mode=args.generation_mode,
-                temperature=args.temperature,
-                max_new_tokens=args.max_new_tokens,
-                verbose=False,
-            )
-            answer = result.get('answer', '')
-        except torch.cuda.OutOfMemoryError:
-            log.warning(
-                f"OOM 발생: {img_path.name} (현재 max_input_size={args.max_input_size}). "
-                "--max_input_size 값을 줄이거나 --expandable_segments 를 추가하세요."
-            )
-            torch.cuda.empty_cache()
-            continue
-        except Exception as e:
-            log.warning(f"추론 실패 {img_path.name}: {e}")
-            continue
-
-        # <box> 태그 파싱 → 카테고리별 cls_id 매핑
-        # LocateAnything은 모든 카테고리를 한 번에 처리하고
-        # 응답 내 박스 순서가 카테고리 순서를 보장하지 않으므로
-        # 카테고리별로 개별 detect 호출하여 cls_id를 명확히 매핑
+        # 클래스별 개별 detect 호출 → cls_id 정확히 매핑
+        # (LocateAnything 다중 카테고리 응답은 박스-클래스 순서를 보장하지 않음)
         all_boxes: List[Tuple] = []
 
-        if len(category_names) == 1:
-            # 단일 클래스: 바로 파싱
-            raw = parse_boxes_normalized(answer)
-            cls_id = category_ids[0]
-            for (x1, y1, x2, y2) in raw:
-                all_boxes.append((x1, y1, x2, y2, 1.0, cls_id))
-        else:
-            # 다중 클래스: 클래스별 개별 호출로 cls_id 정확히 매핑
-            for cls_id, class_name in class_map.items():
-                try:
-                    r = worker.detect(
-                        infer_image,
-                        [class_name],
-                        generation_mode=args.generation_mode,
-                        temperature=args.temperature,
-                        max_new_tokens=args.max_new_tokens,
-                        verbose=False,
-                    )
-                    raw = parse_boxes_normalized(r.get('answer', ''))
-                    for (x1, y1, x2, y2) in raw:
-                        all_boxes.append((x1, y1, x2, y2, 1.0, cls_id))
-                except torch.cuda.OutOfMemoryError:
-                    log.warning(f"OOM: {img_path.name} [{class_name}] 스킵")
-                    torch.cuda.empty_cache()
-                except Exception as e:
-                    log.warning(f"추론 실패 {img_path.name} [{class_name}]: {e}")
+        for cls_id, class_name in class_map.items():
+            try:
+                r = worker.detect(
+                    infer_image,
+                    [class_name],
+                    generation_mode=args.generation_mode,
+                    temperature=args.temperature,
+                    max_new_tokens=args.max_new_tokens,
+                    verbose=False,
+                )
+                raw = parse_boxes_normalized(r.get('answer', ''))
+                for (x1, y1, x2, y2) in raw:
+                    all_boxes.append((x1, y1, x2, y2, 1.0, cls_id))
+            except torch.cuda.OutOfMemoryError:
+                log.warning(
+                    f"OOM 발생: {img_path.name} [{class_name}] "
+                    f"(max_input_size={args.max_input_size}). "
+                    "--max_input_size 를 줄이거나 --expandable_segments 를 추가하세요."
+                )
+                torch.cuda.empty_cache()
+            except Exception as e:
+                log.warning(f"추론 실패 {img_path.name} [{class_name}]: {e}")
 
         # NMS 적용 (LocateAnything은 confidence 없으므로 conf=1.0 고정, IoU만 사용)
         final_boxes = apply_nms(all_boxes, args.nms_mode, args.iou_threshold)
